@@ -133,3 +133,9 @@ PLAYWRIGHT_BROWSER_TYPE = "chromium"
 PLAYWRIGHT_LAUNCH_OPTIONS = {
     "headless": True,  # Set to False to watch the browser work
 }
+
+# PLAYWRIGHT_LAUNCH_OPTIONS = {
+#     "headless": False,
+#     # Optional: slow things down a bit so you can see interactions
+#     "slow_mo": 500,  # milliseconds between actions
+# }

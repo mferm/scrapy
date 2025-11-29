@@ -25,80 +25,43 @@ class GsaSpider(scrapy.Spider):
             self.part_numbers = ['BR32CCP07', 'UNCBR32CCP07']
     
     def start_requests(self):
-        """Step 1: Visit homepage to establish session"""
-        yield scrapy.Request(
-            'https://www.gsaadvantage.gov/',
-            callback=self.after_homepage,
-            meta={
-                'playwright': True,
-                'playwright_include_page': True,
-            },
-            dont_filter=True,
-        )
-
-    async def after_homepage(self, response):
-        """Step 2: Search for each part number using the search form"""
-        page = response.meta.get("playwright_page")
-        
-        if not page:
-            self.logger.error("No Playwright page available")
-            return
+        """
+        Step 1: For each part number, go directly to the search-results URL.
+        We let Scrapy-Playwright render the page and then parse the HTML.
+        """
+        base_url = "https://www.gsaadvantage.gov/advantage/ws/search/advantage_search"
         
         for pn in self.part_numbers:
             self.logger.info(f"Searching for: {pn}")
+            # URL pattern example from saved HTML (note the required leading '8'):
+            # https://www.gsaadvantage.gov/advantage/ws/search/advantage_search?q=0:8859-BBFC&db=0&searchType=0
+            search_term = f"8{pn}"
+            search_url = f"{base_url}?q=0:{search_term}&db=0&searchType=0"
             
-            try:
-                # Navigate to homepage to ensure we're on the search page
-                await page.goto('https://www.gsaadvantage.gov/', wait_until='networkidle', timeout=60000)
-                await page.wait_for_timeout(2000)  # Wait for Angular to load
-                
-                # Find and fill the search input (id="globalSearch")
-                search_input = await page.wait_for_selector('#globalSearch', timeout=10000, state='visible')
-                await search_input.fill('')
-                await search_input.fill(pn)
-                await page.wait_for_timeout(500)  # Small delay after typing
-                
-                # Find and click the search button (type="submit" with name="GO")
-                search_button = await page.wait_for_selector('button[type="submit"][name="GO"]', timeout=5000, state='visible')
-                await search_button.click()
-                
-                # Wait for search results to load
-                await page.wait_for_load_state('networkidle', timeout=60000)
-                await page.wait_for_selector('app-ux-product-display-inline', timeout=10000)
-                await page.wait_for_timeout(2000)  # Extra wait for dynamic content
-                
-                # Get the page content after search
-                content = await page.content()
-                
-                # Create a new response object with the updated content
-                from scrapy.http import HtmlResponse
-                search_response = HtmlResponse(
-                    url=page.url,
-                    body=content.encode('utf-8'),
-                    encoding='utf-8'
-                )
-                # Store part_number on the response object for parsing
-                search_response._part_number = pn
-                
-                # Parse the search results - pass part_number directly
-                for item in self.parse_search_results(search_response, part_number=pn):
-                    yield item
-                
-            except Exception as e:
-                self.logger.error(f"Error searching for {pn}: {e}", exc_info=True)
-                continue
-        
-        # Close the browser page when done
-        if page:
-            await page.close()
-    
-    async def errback_close_page(self, failure):
-        """Handle errors and close browser page"""
+            yield scrapy.Request(
+                search_url,
+                callback=self.parse_search_results,
+                cb_kwargs={"part_number": pn},
+                meta={
+                    "playwright": True,
+                    # We only need the rendered HTML for search results, not the page object
+                    "playwright_include_page": False,
+                    "playwright_page_goto_kwargs": {
+                        "wait_until": "networkidle",
+                        "timeout": 60000,
+                    },
+                },
+                errback=self.errback_search_page,
+                dont_filter=True,
+            )
+
+    async def errback_search_page(self, failure):
+        """Handle errors on search page requests."""
         page = failure.request.meta.get("playwright_page")
         if page:
             await page.close()
-        self.logger.error(f"Request failed: {failure.value}")
-    
+        self.logger.error(f"Search page request failed: {failure.request.url} - {failure.value}")
+
     async def errback_detail_page(self, failure):
         """Handle errors on detail page requests"""
         page = failure.request.meta.get("playwright_page")
@@ -189,58 +152,33 @@ class GsaSpider(scrapy.Spider):
         page = response.meta.get("playwright_page")
         
         if page:
-            # Check if we need to switch to classic design
+            # Prefer URL parameter approach for classic design (faster, less brittle)
             try:
-                # Wait for page to fully load
+                # Wait for initial page load
                 await page.wait_for_load_state('networkidle', timeout=30000)
                 await page.wait_for_timeout(2000)  # Extra wait for Angular
                 
-                # Check if we're on the new design by looking for the classic design link or alert
-                classic_link = await page.query_selector('a[href*="pdNewDesign=false"]')
-                
-                if classic_link:
-                    self.logger.info("Found new design page, switching to classic design...")
-                    # Click the classic design link
-                    await classic_link.click()
-                    # Wait for the classic design to load
-                    await page.wait_for_load_state('networkidle', timeout=60000)
-                    await page.wait_for_timeout(3000)  # Extra wait for classic design to render
+                current_url = page.url
+                if 'pdNewDesign=false' not in current_url:
+                    # Add/force the classic design query parameter
+                    parsed = urlparse(current_url)
+                    query_params = parse_qs(parsed.query)
+                    query_params['pdNewDesign'] = ['false']
+                    new_query = urlencode(query_params, doseq=True)
+                    new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
                     
-                    # Update response with new content
-                    content = await page.content()
-                    from scrapy.http import HtmlResponse
-                    response = HtmlResponse(
-                        url=page.url,
-                        body=content.encode('utf-8'),
-                        encoding='utf-8'
-                    )
-                    self.logger.info("Switched to classic design successfully")
-                else:
-                    # Try alternative: modify URL directly
-                    current_url = page.url
-                    if 'pdNewDesign=false' not in current_url:
-                        # Check if we're missing the classic design table
-                        table_check = await page.query_selector('tr.selectedItem, tr.otherItem')
-                        if not table_check:
-                            # Try adding the parameter to the URL
-                            parsed = urlparse(current_url)
-                            query_params = parse_qs(parsed.query)
-                            query_params['pdNewDesign'] = ['false']
-                            new_query = urlencode(query_params, doseq=True)
-                            new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-                            
-                            self.logger.info(f"Modifying URL to switch to classic design: {new_url}")
-                            await page.goto(new_url, wait_until='networkidle', timeout=60000)
-                            await page.wait_for_timeout(3000)
-                            
-                            # Update response with new content
-                            content = await page.content()
-                            from scrapy.http import HtmlResponse
-                            response = HtmlResponse(
-                                url=page.url,
-                                body=content.encode('utf-8'),
-                                encoding='utf-8'
-                            )
+                    self.logger.info(f"Modifying URL to switch to classic design: {new_url}")
+                    await page.goto(new_url, wait_until='networkidle', timeout=60000)
+                    await page.wait_for_timeout(3000)  # Extra wait for classic design to render
+                
+                # Update response with (possibly) classic-design content
+                content = await page.content()
+                from scrapy.http import HtmlResponse
+                response = HtmlResponse(
+                    url=page.url,
+                    body=content.encode('utf-8'),
+                    encoding='utf-8'
+                )
             except Exception as e:
                 self.logger.warning(f"Error switching to classic design (will try to parse anyway): {e}")
         
